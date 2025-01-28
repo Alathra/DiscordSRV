@@ -32,6 +32,9 @@ import net.dv8tion.jda.api.events.guild.member.GuildMemberRoleRemoveEvent;
 import net.dv8tion.jda.api.exceptions.ErrorResponseException;
 import net.dv8tion.jda.api.hooks.ListenerAdapter;
 import net.dv8tion.jda.api.requests.ErrorResponse;
+import net.luckperms.api.LuckPerms;
+import net.luckperms.api.model.data.DataMutateResult;
+import net.luckperms.api.node.Node;
 import net.milkbowl.vault.permission.Permission;
 import org.apache.commons.lang3.ArrayUtils;
 import org.apache.commons.lang3.StringUtils;
@@ -48,6 +51,7 @@ import org.bukkit.plugin.RegisteredServiceProvider;
 import org.jetbrains.annotations.NotNull;
 
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -308,10 +312,36 @@ public class GroupSynchronizationManager extends ListenerAdapter implements List
                         try {
                             String[] serverGroups = getPermissions().getGroups();
                             if (ArrayUtils.contains(serverGroups, groupName)) {
-                                if (!getPermissions().playerAddGroup(null, player, groupName)) {
+
+                                if (luckPerms) {
+                                    final net.luckperms.api.LuckPerms lp = Bukkit.getServicesManager().load(net.luckperms.api.LuckPerms.class);
+                                    if (lp != null) {
+                                        if (lp.getUserManager().isLoaded(player.getUniqueId())) {
+                                            lp.getUserManager().modifyUser(player.getUniqueId(), lpuser -> {
+                                                final DataMutateResult dataMutateResult = lpuser.data().add(Node.builder("group." + groupName).build());
+
+                                                if (!dataMutateResult.wasSuccessful()) {
+                                                    DiscordSRV.debug(Debug.GROUP_SYNC, "Synchronization #" + id + " for {" + player.getName() + ":" + user + "} failed: adding lp group " + groupName + ", returned a failure");
+                                                    additions.remove(groupName);
+                                                }
+                                            }).join();
+                                        } else {
+                                            final net.luckperms.api.model.user.User lpuser = lp.getUserManager().loadUser(player.getUniqueId()).join();
+                                            final DataMutateResult dataMutateResult = lpuser.data().add(Node.builder("group." + groupName).build());
+
+                                            if (!dataMutateResult.wasSuccessful()) {
+                                                DiscordSRV.debug(Debug.GROUP_SYNC, "Synchronization #" + id + " for {" + player.getName() + ":" + user + "} failed: adding lp group offline " + groupName + ", returned a failure");
+                                                additions.remove(groupName);
+                                            }
+
+                                            lp.getUserManager().saveUser(lpuser);
+                                        }
+                                    }
+                                } else if (!getPermissions().playerAddGroup(null, player, groupName)) {
                                     DiscordSRV.debug(Debug.GROUP_SYNC, "Synchronization #" + id + " for {" + player.getName() + ":" + user + "} failed: adding group " + groupName + ", returned a failure");
                                     additions.remove(groupName);
                                 }
+
                             } else {
                                 DiscordSRV.debug(Debug.GROUP_SYNC, "Synchronization #" + id + " for {" + player.getName() + ":" + user + "} failed: group " + groupName + " doesn't exist (Server's Groups: " + Arrays.toString(serverGroups) + ")");
                             }
@@ -338,14 +368,40 @@ public class GroupSynchronizationManager extends ListenerAdapter implements List
                     List<String> removals = justModifiedGroups.computeIfAbsent(player.getUniqueId(), key -> new HashMap<>()).computeIfAbsent("remove", key -> new ArrayList<>());
                     Runnable runnable = () -> {
                         try {
-                            if (getPermissions().playerInGroup(null, player, groupName)) {
-                                if (!getPermissions().playerRemoveGroup(null, player, groupName)) {
-                                    DiscordSRV.debug(Debug.GROUP_SYNC, "Synchronization #" + id + " for {" + player.getName() + ":" + user + "} failed: removing group " + groupName + " returned a failure");
-                                    removals.add(groupName);
+                            if (luckPerms) {
+                                final net.luckperms.api.LuckPerms lp = Bukkit.getServicesManager().load(net.luckperms.api.LuckPerms.class);
+                                if (lp != null) {
+                                    if (lp.getUserManager().isLoaded(player.getUniqueId())) {
+                                        lp.getUserManager().modifyUser(player.getUniqueId(), lpuser -> {
+                                            final DataMutateResult dataMutateResult = lpuser.data().remove(Node.builder("group." + groupName).build());
+
+                                            if (!dataMutateResult.wasSuccessful()) {
+                                                DiscordSRV.debug(Debug.GROUP_SYNC, "Synchronization #" + id + " for {" + player.getName() + ":" + user + "} failed: removing lp group " + groupName + " returned a failure");
+                                                removals.add(groupName);
+                                            }
+                                        }).join();
+                                    } else {
+                                        final net.luckperms.api.model.user.User lpuser = lp.getUserManager().loadUser(player.getUniqueId()).join();
+                                        final DataMutateResult dataMutateResult = lpuser.data().remove(Node.builder("group." + groupName).build());
+
+                                        if (!dataMutateResult.wasSuccessful()) {
+                                            DiscordSRV.debug(Debug.GROUP_SYNC, "Synchronization #" + id + " for {" + player.getName() + ":" + user + "} failed: removing lp group offline " + groupName + " returned a failure");
+                                            removals.add(groupName);
+                                        }
+
+                                        lp.getUserManager().saveUser(lpuser);
+                                    }
                                 }
                             } else {
-                                DiscordSRV.debug(Debug.GROUP_SYNC, "Synchronization #" + id + " for {" + player.getName() + ":" + user + "} failed: player is not in group \"" + groupName + "\"");
-                                removals.add(groupName);
+                                if (getPermissions().playerInGroup(null, player, groupName)) {
+                                    if (!getPermissions().playerRemoveGroup(null, player, groupName)) {
+                                        DiscordSRV.debug(Debug.GROUP_SYNC, "Synchronization #" + id + " for {" + player.getName() + ":" + user + "} failed: removing group " + groupName + " returned a failure");
+                                        removals.add(groupName);
+                                    }
+                                } else {
+                                    DiscordSRV.debug(Debug.GROUP_SYNC, "Synchronization #" + id + " for {" + player.getName() + ":" + user + "} failed: player is not in group \"" + groupName + "\"");
+                                    removals.add(groupName);
+                                }
                             }
                         } catch (Throwable t) {
                             vaultError("Could not remove a player from a group", t);
